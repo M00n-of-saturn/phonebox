@@ -7,7 +7,7 @@ using System.Text.Json.Nodes;
 
 namespace PhoneBox.Agent;
 
-public sealed record DiscordMember(string Id, string Name, bool Muted, bool Deafened, string? Avatar);
+public sealed record DiscordMember(string Id, string Name, bool Muted, bool Deafened, string? Avatar, bool Speaking = false);
 public sealed record DiscordChannel(string Id, string Name, string? Guild, string? GuildId, string? GuildIcon);
 public sealed record DiscordNotification(long Ts, string Title, string Body);
 public sealed record DiscordSnapshot(bool Connected, string? Error, string? User, bool Muted, bool Deafened,
@@ -25,6 +25,7 @@ public sealed partial class DiscordMonitor(ConfigStore config, ILogger<DiscordMo
 {
     private static readonly string[] Scopes = ["rpc", "rpc.voice.read", "rpc.voice.write", "rpc.notifications.read"];
     private const string Redirect = "http://127.0.0.1";
+    private static readonly string[] SpeakingEvents = ["SPEAKING_START", "SPEAKING_STOP"];
 
     private volatile DiscordSnapshot _snap = Empty(null);
     private readonly object _lock = new();
@@ -52,7 +53,39 @@ public sealed partial class DiscordMonitor(ConfigStore config, ILogger<DiscordMo
     public DiscordSnapshot Snapshot()
     {
         var wanted = NotesNow();
-        lock (_lock) return _snap with { Notifications = wanted ? [.. _notes] : [] };
+        lock (_lock)
+        {
+            var s = _snap;
+            var members = _speaking.Count == 0 || s.ChannelId != _speakingChannel ? s.Members
+                : [.. s.Members.Select(m => _speaking.Contains(m.Id) ? m with { Speaking = true } : m)];
+            return s with { Members = members, Notifications = wanted ? [.. _notes] : [] };
+        }
+    }
+
+    // Who is talking in the voice channel you are in, from Discord's SPEAKING_START / SPEAKING_STOP events (guarded by _lock).
+    private readonly HashSet<string> _speaking = [];
+    private string? _speakingChannel;
+
+    /// <summary>
+    /// The channel whose speaking events count. Setting it (on joining, switching or leaving a channel, and on
+    /// disconnect) forgets who was speaking, so a ring never carries over to another channel or a later call.
+    /// </summary>
+    internal string? SpeakingChannel
+    {
+        get { lock (_lock) return _speakingChannel; }
+        set { lock (_lock) { _speakingChannel = value; _speaking.Clear(); } }
+    }
+
+    internal void ApplySpeaking(string evt, JsonNode? data)
+    {
+        var user = JsonStr((data as JsonObject)?["user_id"]);
+        var channel = JsonStr((data as JsonObject)?["channel_id"]);
+        lock (_lock)
+        {
+            // an event still on its way from the channel you just left, or one that arrives after leaving, is dropped
+            if (user is null || _speakingChannel is null || (channel is not null && channel != _speakingChannel)) return;
+            if (evt == "SPEAKING_START") _speaking.Add(user); else _speaking.Remove(user);
+        }
     }
 
     /// <summary>The user cancelled, the approval timed out or Discord refused the secret: retrying cannot help until the settings change.</summary>
@@ -118,6 +151,7 @@ public sealed partial class DiscordMonitor(ConfigStore config, ILogger<DiscordMo
             _guildChannels.Clear();
             var channelsAt = DateTime.MinValue;
             var channelsEvery = TimeSpan.FromSeconds(60);
+            string? speakingFor = null;
             while (!ct.IsCancellationRequested && !reader.IsCompleted && config.Get().Discord.Enabled)
             {
                 // Notification text (DM content) is only asked for, and only sent on, while a widget shows it.
@@ -138,6 +172,23 @@ public sealed partial class DiscordMonitor(ConfigStore config, ILogger<DiscordMo
                 var rev = Volatile.Read(ref _voiceRev);
                 var vs = await Request("GET_VOICE_SETTINGS", null, null, ct);
                 var sel = await Request("GET_SELECTED_VOICE_CHANNEL", null, null, ct);
+                var selId = sel?["id"]?.GetValue<string>();
+                if (selId != speakingFor)
+                {
+                    // speaking events are per channel: follow the channel you are in (covered by the rpc.voice.read scope)
+                    // A failure only costs the rings for this channel: it is not retried until the channel changes, and
+                    // the rest of the widget keeps working.
+                    SpeakingChannel = selId;
+                    try
+                    {
+                        if (speakingFor is not null)
+                            foreach (var e in SpeakingEvents) await Request("UNSUBSCRIBE", new JsonObject { ["channel_id"] = speakingFor }, e, ct);
+                        if (selId is not null)
+                            foreach (var e in SpeakingEvents) await Request("SUBSCRIBE", new JsonObject { ["channel_id"] = selId }, e, ct);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException) { log.LogDebug("discord: speaking events: {Msg}", ex.Message); }
+                    speakingFor = selId;
+                }
                 var members = sel?["voice_states"]?.AsArray().Select(v => new DiscordMember(
                     v?["user"]?["id"]?.GetValue<string>() ?? "",
                     v?["nick"]?.GetValue<string>() ?? v?["user"]?["global_name"]?.GetValue<string>() ?? v?["user"]?["username"]?.GetValue<string>() ?? "?",
@@ -155,6 +206,7 @@ public sealed partial class DiscordMonitor(ConfigStore config, ILogger<DiscordMo
         {
             _io = null;
             _notesWanted = false;
+            SpeakingChannel = null;
             stop.Cancel();
             try { await reader; } catch { }
             lock (_lock)
@@ -372,6 +424,11 @@ public sealed partial class DiscordMonitor(ConfigStore config, ILogger<DiscordMo
                 }
                 if (op == 4 || msg is not JsonObject obj) continue; // PONG or non-object payload
                 var evt = JsonStr(obj["evt"]);
+                if (JsonStr(obj["cmd"]) == "DISPATCH" && evt is "SPEAKING_START" or "SPEAKING_STOP")
+                {
+                    ApplySpeaking(evt, obj["data"]);
+                    continue;
+                }
                 if (evt == "NOTIFICATION_CREATE")
                 {
                     if (!NotesNow() || obj["data"] is not JsonObject d) continue;

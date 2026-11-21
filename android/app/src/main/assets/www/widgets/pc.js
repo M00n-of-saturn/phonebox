@@ -1,4 +1,4 @@
-import { $, API, D, PANEL_HEADERS, LOCALE, Q_STYLE, api, bridge, cfg, color, cssVar, rulesPaused, toggleRulesPause, fillIcon, fmtDur, fmtHM, fmtMem, gotoPageRef, gpuMem, gpusOf, h, en, haptic, icon, openSheet, paceInfo, pad, pairedPcs, quotaProviders, r1, shortDur, shortGpu, store, switchPc, t, tick, toast, transport, emo, labelled, rich, tp, tpv, quotaText } from '../main.js';
+import { $, API, D, curPage, pages, PANEL_HEADERS, LOCALE, Q_STYLE, api, bridge, cfg, color, cssVar, rulesPaused, toggleRulesPause, fillIcon, fmtDur, fmtHM, fmtMem, gotoPageRef, gpuMem, gpusOf, h, en, haptic, icon, openSheet, paceInfo, pad, pairedPcs, quotaProviders, r1, shortDur, shortGpu, store, switchPc, t, tick, toast, transport, emo, labelled, rich, tp, tpv, quotaText } from '../main.js';
 import { W } from '../registry.js';
 import { canKillAnywhere, dialEl, every } from './helpers.js';
 
@@ -132,8 +132,8 @@ W.obs = {
 // Discord through the desktop app on the PC: the voice channel / call you are in, who is there, mute / deafen / leave,
 // voice channels to join and recent notifications. Buttons only work when the widget allows control.
 W.discord = {
-  needs: ['tick'],
-  create(box, { o }) {
+  needs: ['tick', 'fast'],
+  create(box, { o, page }) {
     let data = null, lastKey = '', busy = null;
     const open = new Set(); // servers whose channels are unfolded
     // a round logo: the image once it has loaded, the first letter until then (and when there is no image)
@@ -155,10 +155,17 @@ W.discord = {
       await new Promise((done) => setTimeout(done, 600));
       await load(); busy = null; render(true);
     };
+    // Who is speaking changes several times a second: that only moves the ring on the chips already drawn, since a full
+    // redraw recreates every avatar and server icon and they flash while they load again.
+    const rings = new Map();
+    const ring = () => { for (const m of data?.snapshot?.members || []) rings.get(m.id)?.classList.toggle('speaking', !!m.speaking); };
     const render = (force = false) => {
-      const key = JSON.stringify([data, busy, [...open], box.clientHeight]);
-      if (!force && key === lastKey) return;
+      const s0 = data?.snapshot;
+      const quiet = s0?.members ? { ...data, snapshot: { ...s0, members: s0.members.map(({ speaking, ...m }) => m) } } : data;
+      const key = JSON.stringify([quiet, busy, [...open], box.clientHeight]);
+      if (!force && key === lastKey) { ring(); return; }
       lastKey = key;
+      rings.clear();
       if (!data) { box.replaceChildren(h('div', 'empty', t('w.loading'))); return; }
       if (!data.enabled) { box.replaceChildren(h('div', 'w-title', en('Discord')), h('div', 'empty', t('w.discord.turnOn'))); return; }
       const s = data.snapshot;
@@ -176,7 +183,11 @@ W.discord = {
         btn('mute', emo(s.muted ? '🔇' : '🎙️'), s.muted, 'mute'), btn('deaf', emo(s.deafened ? '🔕' : '🎧'), s.deafened, 'deafen'),
         s.channelId ? btn('leave', emo('📞'), false, 'leave') : null)];
       if (s.channelId && s.members.length) {
-        kids.push(h('div', 'dc-members', ...s.members.map((m) => h('span', 'dc-member' + (m.deafened ? ' deaf' : m.muted ? ' muted' : ''), ico(m.avatar && img('user', m.id, m.avatar), m.name), rich((m.deafened ? '🔕 ' : m.muted ? '🔇 ' : '') + m.name)))));
+        kids.push(h('div', 'dc-members', ...s.members.map((m) => {
+          const chip = h('span', 'dc-member' + (m.deafened ? ' deaf' : m.muted ? ' muted' : '') + (m.speaking ? ' speaking' : ''), ico(m.avatar && img('user', m.id, m.avatar), m.name), rich((m.deafened ? '🔕 ' : m.muted ? '🔇 ' : '') + m.name));
+          rings.set(m.id, chip);
+          return chip;
+        })));
       }
       if (o.channels !== false && s.channels.length) {
         // one block per server; tap it to unfold its voice channels (the server you are in starts unfolded)
@@ -215,8 +226,19 @@ W.discord = {
       }
       box.replaceChildren(...kids);
     };
-    const tick = every(2000, async () => { await load(); render(); });
-    return { update: () => { tick(); render(); } };
+    // In a channel the widget asks every 500 ms so the speaking ring follows the voice (a local request, answered
+    // from the agent's memory); otherwise every 2 s as before. Off screen (a neighbouring page, a Smart Stack card
+    // that isn't showing, the app in the background) it doesn't ask at all, and catches up within 250 ms of showing.
+    const visible = () => box.isConnected && !document.hidden && pages[curPage] === page && !box.closest('.stack-item:not(.active)');
+    let next = 0, asking = false;
+    const poll = () => {
+      if (asking || !visible() || Date.now() < next) return; // a slow answer is never overtaken by the next request
+      asking = true;
+      // the pace follows the answer just received, so joining or leaving a channel changes it at once
+      load().then(() => { asking = false; next = Date.now() + (data?.snapshot?.channelId ? 500 : 2000); render(); });
+    };
+    // 'fast' (every 250 ms) drives the asking; 'tick' (every second) also redraws when the widget's size changes
+    return { update: (kind) => { poll(); if (kind !== 'fast') render(); } };
   },
 };
 

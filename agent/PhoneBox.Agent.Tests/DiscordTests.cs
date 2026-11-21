@@ -246,6 +246,93 @@ public sealed class DiscordTests : IDisposable
         }
     }
 
+    // ---- who is speaking ----
+
+    private static DiscordSnapshot InRoom(string channel = "c1") => new(true, null, "me", false, false, channel, "Room", "voice",
+        [new("7", "Ana", false, false, null), new("8", "Bo", false, false, null)], [], []);
+
+    private static string Speaking(string evt, string user, string? channel = "c1") =>
+        new JsonObject { ["cmd"] = "DISPATCH", ["evt"] = evt, ["data"] = new JsonObject { ["user_id"] = user, ["channel_id"] = channel } }.ToJsonString();
+
+    private static bool IsSpeaking(DiscordMonitor m, string id) => m.Snapshot().Members.Single(x => x.Id == id).Speaking;
+
+    [Fact]
+    public async Task A_member_speaks_between_SPEAKING_START_and_SPEAKING_STOP()
+    {
+        var monitor = Monitor(false);
+        monitor.PublishPoll(0, false, false, InRoom());
+        monitor.SpeakingChannel = "c1";
+        var (server, client) = await Pipe();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await using (server) await using (client)
+        {
+            var loop = monitor.ReadLoop(client, cts.Token);
+            await server.WriteAsync(Frame(1, Speaking("SPEAKING_START", "7")), cts.Token);
+            await Until(() => IsSpeaking(monitor, "7"));
+            Assert.False(IsSpeaking(monitor, "8"));
+            await server.WriteAsync(Frame(1, Speaking("SPEAKING_STOP", "7")), cts.Token);
+            await Until(() => !IsSpeaking(monitor, "7"));
+            cts.Cancel();
+            try { await loop; } catch (OperationCanceledException) { }
+        }
+    }
+
+    [Fact]
+    public void Speaking_events_from_another_channel_or_outside_a_channel_are_ignored()
+    {
+        var monitor = Monitor(false);
+        monitor.PublishPoll(0, false, false, InRoom());
+        monitor.ApplySpeaking("SPEAKING_START", JsonNode.Parse("""{"user_id":"7","channel_id":"c1"}"""));
+        Assert.False(IsSpeaking(monitor, "7"));                                   // not following a channel yet
+        monitor.SpeakingChannel = "c1";
+        monitor.ApplySpeaking("SPEAKING_START", JsonNode.Parse("""{"user_id":"7","channel_id":"c2"}"""));
+        Assert.False(IsSpeaking(monitor, "7"));                                   // late event from the channel left
+        monitor.ApplySpeaking("SPEAKING_START", JsonNode.Parse("""{"user_id":"7"}"""));
+        Assert.True(IsSpeaking(monitor, "7"));                                    // older Discord builds send no channel id
+    }
+
+    [Fact]
+    public void Switching_channels_forgets_who_was_speaking()
+    {
+        var monitor = Monitor(false);
+        monitor.PublishPoll(0, false, false, InRoom());
+        monitor.SpeakingChannel = "c1";
+        monitor.ApplySpeaking("SPEAKING_START", JsonNode.Parse("""{"user_id":"7","channel_id":"c1"}"""));
+        Assert.True(IsSpeaking(monitor, "7"));
+        monitor.SpeakingChannel = "c2";                                           // you moved; no STOP will come from c1
+        monitor.SpeakingChannel = "c1";                                           // and back again
+        Assert.False(IsSpeaking(monitor, "7"));
+    }
+
+    [Fact]
+    public void A_snapshot_of_another_channel_shows_no_one_speaking()
+    {
+        var monitor = Monitor(false);
+        monitor.SpeakingChannel = "c1";
+        monitor.ApplySpeaking("SPEAKING_START", JsonNode.Parse("""{"user_id":"7","channel_id":"c1"}"""));
+        monitor.PublishPoll(0, false, false, InRoom("c2"));                       // the poll already sees the new channel
+        Assert.False(IsSpeaking(monitor, "7"));
+    }
+
+    [Fact]
+    public async Task The_answer_to_a_SUBSCRIBE_for_speaking_events_still_reaches_the_request()
+    {
+        var monitor = Monitor(false);
+        monitor.SpeakingChannel = "c1";
+        var (server, client) = await Pipe();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var waiting = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        monitor._pending["sub"] = waiting;
+        await using (server) await using (client)
+        {
+            var loop = monitor.ReadLoop(client, cts.Token);
+            await server.WriteAsync(Frame(1, """{"cmd":"SUBSCRIBE","evt":"SPEAKING_START","nonce":"sub","data":{"evt":"SPEAKING_START"}}"""), cts.Token);
+            Assert.Equal("SPEAKING_START", (await waiting.Task.WaitAsync(cts.Token))!["evt"]!.GetValue<string>());
+            cts.Cancel();
+            try { await loop; } catch (OperationCanceledException) { }
+        }
+    }
+
     // ---- images ----
 
     [Theory]
