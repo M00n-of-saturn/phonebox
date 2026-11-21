@@ -230,9 +230,12 @@ W.discord = {
     // from the agent's memory); otherwise every 2 s as before. Off screen (a neighbouring page, a Smart Stack card
     // that isn't showing, the app in the background) it doesn't ask at all, and catches up within 250 ms of showing.
     const visible = () => box.isConnected && !document.hidden && pages[curPage] === page && !box.closest('.stack-item:not(.active)');
-    let next = 0, asking = false;
+    let next = 0, asking = false, shown = false;
     const poll = () => {
-      if (asking || !visible() || Date.now() < next) return; // a slow answer is never overtaken by the next request
+      const now = visible();
+      if (now && !shown) next = 0; // shown again: catch up at once instead of waiting out the old pace
+      shown = now;
+      if (asking || !now || Date.now() < next) return; // a slow answer is never overtaken by the next request
       asking = true;
       // the pace follows the answer just received, so joining or leaving a channel changes it at once
       load().then(() => { asking = false; next = Date.now() + (data?.snapshot?.channelId ? 500 : 2000); render(); });

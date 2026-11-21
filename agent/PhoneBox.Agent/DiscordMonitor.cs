@@ -152,6 +152,7 @@ public sealed partial class DiscordMonitor(ConfigStore config, ILogger<DiscordMo
             var channelsAt = DateTime.MinValue;
             var channelsEvery = TimeSpan.FromSeconds(60);
             string? speakingFor = null;
+            long speakingRetryAt = 0; // after a failed (un)subscribe: when to set the channel's subscriptions up again
             while (!ct.IsCancellationRequested && !reader.IsCompleted && config.Get().Discord.Enabled)
             {
                 // Notification text (DM content) is only asked for, and only sent on, while a widget shows it.
@@ -173,12 +174,14 @@ public sealed partial class DiscordMonitor(ConfigStore config, ILogger<DiscordMo
                 var vs = await Request("GET_VOICE_SETTINGS", null, null, ct);
                 var sel = await Request("GET_SELECTED_VOICE_CHANNEL", null, null, ct);
                 var selId = sel?["id"]?.GetValue<string>();
-                if (selId != speakingFor)
+                if (selId != speakingFor || (speakingRetryAt != 0 && Environment.TickCount64 >= speakingRetryAt))
                 {
                     // speaking events are per channel: follow the channel you are in (covered by the rpc.voice.read scope)
-                    // A failure only costs the rings for this channel: it is not retried until the channel changes, and
-                    // the rest of the widget keeps working.
+                    // A failure only costs the rings for this channel and the rest of the widget keeps working. Half a
+                    // subscription (START without STOP) would leave a ring on, so after a failure the channel's two
+                    // subscriptions are set up again from scratch, at most every 30 s.
                     SpeakingChannel = selId;
+                    speakingRetryAt = 0;
                     try
                     {
                         if (speakingFor is not null)
@@ -186,7 +189,12 @@ public sealed partial class DiscordMonitor(ConfigStore config, ILogger<DiscordMo
                         if (selId is not null)
                             foreach (var e in SpeakingEvents) await Request("SUBSCRIBE", new JsonObject { ["channel_id"] = selId }, e, ct);
                     }
-                    catch (Exception ex) when (ex is not OperationCanceledException) { log.LogDebug("discord: speaking events: {Msg}", ex.Message); }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        log.LogDebug("discord: speaking events: {Msg}", ex.Message);
+                        SpeakingChannel = null; // no rings until both subscriptions are in place
+                        speakingRetryAt = Environment.TickCount64 + 30_000;
+                    }
                     speakingFor = selId;
                 }
                 var members = sel?["voice_states"]?.AsArray().Select(v => new DiscordMember(
